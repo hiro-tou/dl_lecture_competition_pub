@@ -10,7 +10,8 @@ import torch
 import torch.nn as nn
 import torchvision
 from torchvision import transforms
-
+import datetime #日時
+import contractions as contractions_lib #短縮形直す
 
 def set_seed(seed):
     random.seed(seed)
@@ -22,7 +23,49 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
-def process_text(text):
+def process_text_question(text):
+    # lowercase
+    text = text.lower()
+
+    # 数詞を数字に変換
+    num_word_to_digit = {
+        'zero': '0', 'one': '1', 'two': '2', 'three': '3', 'four': '4',
+        'five': '5', 'six': '6', 'seven': '7', 'eight': '8', 'nine': '9',
+        'ten': '10'
+    }
+    for word, digit in num_word_to_digit.items():
+        text = text.replace(word, digit)
+
+    # 小数点のピリオドを削除
+    text = re.sub(r'(?<!\d)\.(?!\d)', '', text)
+
+    # 冠詞の削除
+    text = re.sub(r'\b(a|an|the)\b', '', text)
+
+    # 短縮形のカンマの追加
+    contractions = {
+        "dont": "don't", "isnt": "isn't", "arent": "aren't", "wont": "won't",
+        "cant": "can't", "wouldnt": "wouldn't", "couldnt": "couldn't"
+    }
+    for contraction, correct in contractions.items():
+        text = text.replace(contraction, correct)
+        
+    #短縮形を直す
+    for k, v in contractions_lib.contractions_dict.items():
+        text = text.replace(k.lower(), v.lower())
+
+    # 句読点をスペースに変換
+    text = re.sub(r"[^\w\s':]", ' ', text)
+
+    # 句読点をスペースに変換
+    text = re.sub(r'\s+,', ',', text)
+
+    # 連続するスペースを1つに変換
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    return text
+
+def process_text_answer(text):
     # lowercase
     text = text.lower()
 
@@ -60,7 +103,6 @@ def process_text(text):
 
     return text
 
-
 # 1. データローダーの作成
 class VQADataset(torch.utils.data.Dataset):
     def __init__(self, df_path, image_dir, transform=None, answer=True):
@@ -77,7 +119,7 @@ class VQADataset(torch.utils.data.Dataset):
 
         # 質問文に含まれる単語を辞書に追加
         for question in self.df["question"]:
-            question = process_text(question)
+            question = process_text_question(question)
             words = question.split(" ")
             for word in words:
                 if word not in self.question2idx:
@@ -89,7 +131,7 @@ class VQADataset(torch.utils.data.Dataset):
             for answers in self.df["answers"]:
                 for answer in answers:
                     word = answer["answer"]
-                    word = process_text(word)
+                    word = process_text_answer(word)
                     if word not in self.answer2idx:
                         self.answer2idx[word] = len(self.answer2idx)
             self.idx2answer = {v: k for k, v in self.answer2idx.items()}  # 逆変換用の辞書(answer)
@@ -131,7 +173,9 @@ class VQADataset(torch.utils.data.Dataset):
         image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
         image = self.transform(image)
         question = np.zeros(len(self.idx2question) + 1)  # 未知語用の要素を追加
-        question_words = self.df["question"][idx].split(" ")
+        question_word = self.df["question"][idx]
+        question_word = process_text_question(question_word)
+        question_words = question_word.split(" ")
         for word in question_words:
             try:
                 question[self.question2idx[word]] = 1  # one-hot表現に変換
@@ -139,7 +183,7 @@ class VQADataset(torch.utils.data.Dataset):
                 question[-1] = 1  # 未知語
 
         if self.answer:
-            answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
+            answers = [self.answer2idx[process_text_answer(answer["answer"])] for answer in self.df["answers"][idx]]
             mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
 
             return image, torch.Tensor(question), torch.Tensor(answers), int(mode_answer_idx)
@@ -357,53 +401,91 @@ def eval(model, dataloader, optimizer, criterion, device):
 
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
+#画像の前処理
+class gcn():
+    def __init__(self):
+        pass
+
+    def __call__(self, x):
+        mean = torch.mean(x)
+        std = torch.std(x)
+        return (x - mean)/(std + 10**(-6))  # 0除算を防ぐ
+
+
+
 
 def main():
     # deviceの設定
     set_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
+    
+    #同時処理数とAutomaticMemoryPinningの設定
+    workers = 16
+    pin_mem = True
+    
+	#デバイスの確認と同時処理数の表示
+    print(f"Device={device},num_workers={workers},pin_memory={pin_mem}",datetime.datetime.now().strftime('%Y/%m/%d %H:%M:%S'))
+	
     # dataloader / model
+    GCN = gcn()
     transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(p=0.5),                               #ランダムに水平方向に反転させる
+        transforms.RandomRotation(degrees=(-180, 180)),                       #ランダムに回転させる
+        transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5), #ColorJitterでランダムに画像の明るさ、コントラスト、彩度、色相を変化させる
         transforms.Resize((224, 224)),
-        transforms.ToTensor()
+        #transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),            #画像をぼかす
+        transforms.ToTensor(),
+        GCN                                                                   #Global Contrast Normalization (GCN) 
     ])
     train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
     test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
     test_dataset.update_dict(train_dataset)
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
+
+
+    #実行速度を上げるために同時処理数(num_workers=15)とAutomaticMemoryPinningを有効(pin_memory=True)にする
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=workers, pin_memory=pin_mem)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=workers, pin_memory=pin_mem)
 
     model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
 
     # optimizer / criterion
-    num_epoch = 20
+    total_epoch = 0
+    num_epoch = 5
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
 
-    # train model
-    for epoch in range(num_epoch):
-        train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device)
-        print(f"【{epoch + 1}/{num_epoch}】\n"
-              f"train time: {train_time:.2f} [s]\n"
-              f"train loss: {train_loss:.4f}\n"
-              f"train acc: {train_acc:.4f}\n"
-              f"train simple acc: {train_simple_acc:.4f}")
+    for loop_n in range(4):
+        total_epoch += num_epoch
+        print(f"Start Train epoch={num_epoch}({total_epoch})",datetime.datetime.now().strftime('%Y/%m/%d %H:%M:%S'))
 
-    # 提出用ファイルの作成
-    model.eval()
-    submission = []
-    for image, question in test_loader:
-        image, question = image.to(device), question.to(device)
-        pred = model(image, question)
-        pred = pred.argmax(1).cpu().item()
-        submission.append(pred)
+        # train model
+        for epoch in range(num_epoch):
+            train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device)
+            print(f"【{epoch + 1}/{num_epoch}】\n"
+                  f"train time: {train_time:.2f} [s]\n"
+                  f"train loss: {train_loss:.4f}\n"
+                  f"train acc: {train_acc:.4f}\n"
+                  f"train simple acc: {train_simple_acc:.4f}")
 
-    submission = [train_dataset.idx2answer[id] for id in submission]
-    submission = np.array(submission)
-    torch.save(model.state_dict(), "model.pth")
-    np.save("submission.npy", submission)
+        # 提出用ファイルの作成
+        model.eval()
+        submission = []
+        for image, question in test_loader:
+            image, question = image.to(device), question.to(device)
+            pred = model(image, question)
+            pred = pred.argmax(1).cpu().item()
+            submission.append(pred)
+
+        submission = [train_dataset.idx2answer[id] for id in submission]
+        submission = np.array(submission)
+        #終了時刻をファイル名に付加
+        now = datetime.datetime.now()
+        torch.save(model.state_dict(), "model_" + now.strftime('%Y%m%d_%H%M%S') + ".pth")
+        np.save("submission_" + now.strftime('%Y%m%d_%H%M%S') + ".npy", submission)
+        
+        print(f"Total epoch = {total_epoch}",now.strftime('%Y/%m/%d %H:%M:%S'))
+        print("")
 
 if __name__ == "__main__":
     main()
